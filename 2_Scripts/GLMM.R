@@ -3,7 +3,7 @@ library(dplyr)
 library(DHARMa)
 library(spdep)
 library(lme4)
-library(glmmTMB)
+library(glmer)
 library(tidyverse)
 library(brms)
 library(bayesplot)
@@ -15,8 +15,10 @@ library(mgcv)  # for GAM fitting
 library(sjPlot)
 library(glmm.hp)
 library(MuMIn)
-remove.packages("glmmTMB")
-install.packages('TMB', type = 'source')
+library(performance)
+library(ggplot2)
+library(lattice)
+
 
 # 500m Scale -----------------------------------------------------------------------------------------------------------------
 # Load datasets 
@@ -97,8 +99,7 @@ plot(full_data$Northing, residauto)
 # Step 1: Initial GLM
 # Fit the GLMM
 ## A Method---------------------------------------------------------------------------------------------------
-glm_long <- glm(occupancy ~ prop_habitat_std + edge_density_std + duration +
-                  survey_year, data = methodA_500m, family = binomial)
+glm_long <- glm(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std, data = methodA_500m, family = binomial)
 summary(glm_long)
 
 # Step 2: Handle spatial autocorrelation
@@ -121,13 +122,29 @@ methodA_500m <- methodA_500m %>%
   )
 
 
-modA500 <- glmmTMB(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
+modA500 <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
                      (1 | gisid) + (1 | survey_year), 
                    data = methodA_500m, family = binomial)
 summary(modA500)
 
+modA500_A <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + autocov +
+                     (1 | gisid) + (1 | survey_year), 
+                   data = methodA_500m, family = binomial)
+summary(modA500_A)
 
+modA500_F <- glmer(occupancy ~ offset(log(qpad)) + edge_density_std + autocov +
+                       (1 | gisid) + (1 | survey_year), 
+                     data = methodA_500m, family = binomial)
+summary(modA500_F)
 
+modA500_int <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std*edge_density_std + autocov +
+                       (1 | gisid) + (1 | survey_year), 
+                     data = methodA_500m, family = binomial)
+summary(modA500_int)
+
+aic_table <- AIC(modA500, modA500_A, modA500_F, modA500_int)
+aic_sorted <- aic_table[order(aic_table$AIC), ]
+print(aic_sorted)
 
 ## B Method--------------------------------------------------------------------------------------------
 # Step 1: Initial GLM
@@ -159,21 +176,42 @@ methodB_500m <- methodB_500m %>%
     autocov = scale(autocov, center = TRUE, scale = TRUE)[,1]
   )
 
-modB500 <- glmmTMB(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
+modB500 <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
                      (1 | gisid) + (1 | survey_year), 
                    data = methodB_500m, family = binomial)
 summary(modB500)
 
+modB500_A <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + autocov +
+                       (1 | gisid) + (1 | survey_year), 
+                     data = methodB_500m, family = binomial)
+summary(modB500_A)
+
+modB500_F <- glmer(occupancy ~ offset(log(qpad)) + edge_density_std + autocov +
+                       (1 | gisid) + (1 | survey_year), 
+                     data = methodB_500m, family = binomial)
+summary(modB500_F)
+
+modB500_int <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std*edge_density_std + autocov +
+                         (1 | gisid) + (1 | survey_year), 
+                       data = methodB_500m, family = binomial)
+summary(modB500_int)
+
+aic_table <- AIC(modB500, modB500_A, modB500_F, modB500_int)
+aic_sortedB <- aic_table[order(aic_table$AIC), ]
+print(aic_sortedB)
+
+
 # C Method------------------------------------------------------------------------------------------------- 
 # Step 1: Initial GLM
 # Fit the GLMM
-glm_long <- glm(occupancy ~ prop_habitat_std + edge_density_std + duration +
-                  survey_year, data = methodC_500m, family = binomial)
-summary(glm_long)
+modC500int_NOxy <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                      (1 | gisid / season) + (1 | survey_year),
+                    data = methodC_500m, family = binomial)
+summary(modC500int_NOxy)
 
 # Step 2: Handle spatial autocorrelation
 # Run GAM with residuals to add as autocovariate in my model 
-residauto <- residuals(glm_long)
+residauto <- residuals(modC500int_NOxy)
 modelgam <- gam(residauto ~ s(Easting, Northing), family = gaussian, data = methodC_500m)
 methodC_500m$autocov <- fitted(modelgam)
 
@@ -182,6 +220,7 @@ methodC_500m$autocov <- fitted(modelgam)
 methodC_500m <- methodC_500m %>%
   mutate(
     survey_year = factor(survey_yea),
+    season = paste(gisid, year_id, sep = "_"),
     duration = factor(duration),
     prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
     edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
@@ -191,21 +230,70 @@ methodC_500m <- methodC_500m %>%
     autocov = scale(autocov, center = TRUE, scale = TRUE)[,1]
   )
 
-modC500 <- glmmTMB(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
-                     (1 | gisid) + (1 | survey_year), 
+modC500int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + autocov + scale(as.numeric(survey_year)) +
+                     (1 | gisid / season) + (1 | survey_year), 
                    data = methodC_500m, family = binomial)
-summary(modC500)
+summary(modC500int)
+
+
+# Habitat amt only 
+modC500_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + autocov +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodC_500m, family = binomial)
+summary(modC500_A)
+
+
+# Frag only 
+modC500_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + autocov +
+                       (1 | gisid / season) + (1 | survey_year), 
+                     data = methodC_500m, family = binomial)
+summary(modC500_F)
+
+# amt + frag 
+modC500_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + autocov +
+                         (1 | gisid / season) + (1 | survey_year), 
+                       data = methodC_500m, family = binomial)
+summary(modC500_AF)
+
+model.sel(modC500int, modC500_A, modC500_AF, modC500_F)
   
-# Check model summaries
-summary(modA500)
-summary(modB500)
-summary(modC500)
+plot_models(modC500int, modC500_A, modC500_AF, modC500_F, transform = NULL) # can make this pretty and use it as supp mat 
+# Forest coefficient plots for the four model varainats showing standardized effect sizes in the link scale 
 
+# Marginal model predictions (response curves)
+plot_model(modC500int, type = "int", mdrt.values = "quart")
 
-# Model Comparison
-# Compare AIC
-print("AIC comparison:")
-print(AIC(modA500, modB500, modC500))
+plot_model(modC500int, type = "pred")
+
+library(lmtest)
+
+lrtest(modC500int, modC500_AF)
+
+# Variance partitioning 
+library(partR2)
+library(parallel)
+library(future)
+library(furrr)
+parallel::detectCores()
+plan(multisession, workers=18)
+glmm.hp(modC500_AF)
+?partR2
+summary(modC500int)
+r2part <- partR2(
+  modC500int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"),
+  data = methodC_500m,
+  R2_type = "marginal",
+  max_level = NULL,
+  nboot = 99,
+  CI = 0.95,
+  parallel = T,
+  expct = "meanobs",
+  olre = F,
+  partbatch = NULL,
+  allow_neg_r2 = FALSE
+)
+(y <- forestplot(r2part, type = c("R2")))
 
 # Calculate R2 for mixed models (both marginal and conditional)
 r.squaredGLMM(modA500)
@@ -214,6 +302,72 @@ r.squaredGLMM(modC500)
 
 
 
+# spatial autocorrelation test 
+library(ncf)
+install.packages("pgirmess")
+library(pgirmess)
+library(spdep) 
+resid <- residuals(modC500int)
+residnospace <- residuals(modC500_NOxy)
+coord <- cbind(methodC_500m$Easting, methodC_500m$Northing)
+
+correlog_noXY <- pgirmess::correlog(coords = coord, z = residnospace, method = "Moran", nbclass = 10)
+spline_corr_noXY <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing, 
+                                    residnospace, resamp = 100, type = "boot")
+plot(spline_corr_noXY, ylim = c(-0.2, 0.2))
+correlog <- pgirmess::correlog(coords = coord, z = resid, method = "Moran", nbclass = 10)
+plot(correlog)
+spline_corr <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing, 
+                                         resid, resamp = 100, type = "boot")
+
+plot(spline_corr, ylim = c(-0.2, 0.2))
+
+
+# temporal autocorrelation checks 
+pacf(residuals(modC500int))
+
+# Diagnostics ---------------------------------------------------------------------------------------- 
+# Function to perform comprehensive GLMM diagnostics
+check_glmm <- function(model, modelname = "Model") {
+  
+  # 1. Create DHARMa residuals
+  sim_resid <- simulateResiduals(model)
+  
+  # 2. Basic DHARMa diagnostic plots
+  plot(sim_resid)
+  
+  # 3. Check for zero-inflation
+  testZeroInflation(sim_resid)
+  
+  # 4. Check for dispersion
+  testDispersion(sim_resid)
+  
+  # 5. Spatial autocorrelation in residuals
+  acf(residuals(model), main = paste(modelname, "- ACF of Residuals"))
+  
+  # 7. Check variance inflation factors for fixed effects
+  print("Variance Inflation Factors:")
+  print(check_collinearity(model))
+  
+  # 8. Check model convergence
+  print("Model convergence check:")
+  print(check_convergence(model))
+  
+  # 9. Check singularity
+  print("Singularity check:")
+  print(check_singularity(model))
+  
+  # 10. Performance metrics
+  print("Performance metrics:")
+  print(model_performance(model))
+  
+}
+
+# Usage example for your models:
+# Individual model checks
+check_glmm(modA500, "Model A")
+check_glmm(modB500, "Model B")
+check_glmm(modC500, "Model C")
 
 
 
@@ -221,147 +375,8 @@ r.squaredGLMM(modC500)
 
 
 
-# Retain detection histories 
-# Load data
-visit_matrix <- read.csv("1_Data/2yearvisitmatrix.csv")
-detection_covariates <- read.csv("1_Data/visitsfordetcovs.csv")
-habitat_metricsA <- read.csv("~/Chapter 2/Chapter 2 Analysis/Extract_patch_metrics/0_data/2_combined/564habitat_metrics_hyp1.csv")
-habitat_metricsB <- read.csv("~/Chapter 2/Chapter 2 Analysis/Extract_patch_metrics/0_data/2_combined/564habitat_metrics_hyp2.csv")
-habitat_metrics <- read.csv("~/Chapter 2/Chapter 2 Analysis/Extract_patch_metrics/0_data/2_combined/landscape_metrics/500landscape_metrics_hyp3.csv")
-
-# Step 1: Pivot Visit Matrix to Long Format
-visit_long <- visit_matrix %>%
-  pivot_longer(
-    cols = starts_with("X"),
-    names_to = "visit_id", 
-    values_to = "occupancy"
-  ) %>%
-  # Extract year and visit number using substr
-  mutate(
-    year = as.numeric(substr(visit_id, 2, 2)),
-    visit_num = as.numeric(substr(visit_id, 4, 4)))
-    
-    
-# Step 2: Join Detection Covariates
-detection_data <- detection_covariates %>%
-  rename(survey_year = year) %>%
-  rename(year = year_id) %>%
-  select(gisid, surveyid, survey_year, year, visit_num, offset, BTNW_binary) %>%
-  inner_join(visit_long, by = c("gisid", "year", "visit_num"))
-head(detection_data)
-head(habitat_metrics_expanded)
-
-expanded_habitat <- habitat_metrics %>%
-  group_by(surveyid, survey_yea) %>%
-  expand(visit_num = 1:3) %>%  # Add rows for three visits
-  left_join(habitat_metrics, by = c("surveyid", "survey_yea"))
-head(expanded_habitat)
-# Step 3: Merge Habitat Metrics (Site × Year Level)
-final_data <- detection_data %>%
-  inner_join(habitat_metrics_expanded, by = c("surveyid", "visit_num")) %>% 
-  arrange(surveyid)
-
-write.csv(habitat_metrics_expanded, "3_Outputs/habitat_metrics_expanded.csv")
-write.csv(detection_data, "3_Outputs/detection_data.csv")
-# Step 4: Ensure Habitat Metrics Are Site × Year-Specific
-# Add standardized habitat covariates
-final_data <- final_data %>%
-  # Standardize continuous covariates and create factors
-  mutate(
-    # Standardize continuous variables
-    habitat_amount_std = as.vector(scale(habitat_amount)),
-    num_patches_std = as.vector(scale(num_patches)),
-    edge_density_std = as.vector(scale(edge_density)),
-    
-    # Create factors
-    survey_year = factor(survey_year),
-    gisid = factor(gisid)
-  )
-write.csv(final_data, "1_Data/glmm/methodC.csv")
-glm_detC <- brm(
-  occupancy ~ offset(log(offset)) + habitat_amount_std + edge_density_std + autocov +
-    (1 | gisid) + (1 | survey_year),
-  family = bernoulli(),
-  data = final_data,
-  prior = c(
-    prior(normal(0, 0.5), class = "b"),
-    prior(normal(0, 0.5), class = "sd", lb = 0)
-  ))#,
-  control = list(adapt_delta = 0.95)  # Increased from default 0.8
-)
-
-summary(glm_detC)
-
-glm_detCint <- brm(
-  occupancy ~ offset(log(offset)) + habitat_amount_std:edge_density_std + autocov +
-    (1 | gisid) + (1 | survey_year),
-  family = bernoulli(),
-  data = final_data,
-  prior = c(
-    prior(normal(0, 0.5), class = "b"),
-    prior(normal(0, 0.5), class = "sd", lb = 0)
-  )
-)
-summary(glm_detCint)
-
-glm_detCamt <- brm(
-  occupancy ~ offset(log(offset)) + habitat_amount_std + autocov +
-    (1 | gisid) + (1 | survey_year),
-  family = bernoulli(),
-  data = final_data,
-  prior = c(
-    prior(normal(0, 0.5), class = "b"),
-    prior(normal(0, 0.5), class = "sd", lb = 0)
-  )
-)
-summary(glm_detCamt)
-
-glm_detCfrag <- brm(
-  occupancy ~ offset(log(offset)) + edge_density_std + autocov +
-    (1 | gisid) + (1 | survey_year),
-  family = bernoulli(),
-  data = final_data,
-  prior = c(
-    prior(normal(0, 0.5), class = "b"),
-    prior(normal(0, 0.5), class = "sd", lb = 0)
-  )
-)
-summary(glm_detCfrag)
 
 
-# Add LOO criterion to models
-glm_detC <- add_criterion(glm_detC, "loo")
-glm_detCint <- add_criterion(glm_detCint, "loo")
-glm_detCamt <- add_criterion(glm_detCamt, "loo")
-glm_detCfrag <- add_criterion(glm_detCfrag, "loo")
-
-# Now compare
-model_comparison <- loo_compare(
-  glm_detC,
-  glm_detCint,
-  glm_detCamt, 
-  glm_detCfrag
-)
-
-# Variance partitioning for full model
-R2_full <- bayes_R2(glm_detC)
-var_partition <- posterior_summary(VarCorr(glm_detC))
-
-# Get random effects variance
-ranef_summary <- VarCorr(glm_detC)
-print(ranef_summary)
-
-# Get fixed effects variance
-fixef_posterior <- fixef(glm_detC)
-var_habitat <- fixef_posterior["habitat_amount_std", "Estimate"]^2
-var_frag <- fixef_posterior["edge_density_std", "Estimate"]^2
-
-# Compare magnitudes
-effect_comparison <- data.frame(
-  habitat = abs(posterior$b_habitat_amount_std),
-  fragmentation = abs(posterior$b_edge_density_std)
-)
-prob_hab_larger <- mean(effect_comparison$habitat > effect_comparison$fragmentation)
 
 
 # 1. Create prediction plots
