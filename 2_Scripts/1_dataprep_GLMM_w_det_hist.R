@@ -2,12 +2,14 @@
 library(tidyr)
 library(dplyr)
 library(lubridate)
+getwd()
 
 
 # Load datasets (update file paths as needed)
 visit_matrix <- read.csv("1_Data/2yearvisitmatrix.csv")
 visits_for_det_covs <- read.csv("1_Data/visitsfordetcovs.csv")
-# 500m scale 
+
+# 500m scale ----------------------------------------------------------------------
 habitat_metricsA500 <- read.csv("1_Data/500m/habitat_metrics_hyp1.csv")
 habitat_metricsB500 <- read.csv("1_Data/500m/habitat_metrics_hyp2.csv")
 habitat_metricsC500 <- read.csv("1_Data/500m/habitat_metrics_hyp3.csv")
@@ -294,8 +296,8 @@ hist(methodA_150m$edge_density)
 range(methodA_150m$edge_density)
 summary(methodA_150m$edge_density)
 # Remove the outliers if needed
-#methodC_1000m <- methodC_1000m %>% 
-# filter(edge_density < 0.1)
+methodA_150m <- methodA_150m %>% 
+ filter(edge_density < 0.4)
 
 # Prepare data
 methodA_150m <- methodA_150m %>%
@@ -363,8 +365,9 @@ hist(methodB_150m$edge_density)
 range(methodB_150m$edge_density)
 summary(methodB_150m$edge_density)
 # Remove the outliers if needed
-#methodC_1000m <- methodC_1000m %>% 
-# filter(edge_density < 0.1)
+methodB_150m <- methodB_150m %>% 
+  filter(edge_density < 0.4)
+
 
 # Prepare data
 methodB_150m <- methodB_150m %>%
@@ -433,9 +436,8 @@ hist(methodC_150m$edge_density)
 range(methodC_150m$edge_density)
 summary(methodC_150m$edge_density)
 # Remove the outliers if needed
-#methodC_1000m <- methodC_1000m %>% 
-# filter(edge_density < 0.1)
-
+methodC_1000m <- methodC_1000m %>% 
+ filter(edge_density < 0.4)
 
 # Prepare data
 methodC_150m <- methodC_150m %>%

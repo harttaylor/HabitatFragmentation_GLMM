@@ -95,279 +95,1384 @@ plot(full_data$Northing, residauto)
 
 
 
-# Start with basic GLM + spatial autocorrelation
-# Step 1: Initial GLM
-# Fit the GLMM
-## A Method---------------------------------------------------------------------------------------------------
-glm_long <- glm(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std, data = methodA_500m, family = binomial)
-summary(glm_long)
+# A Method--------------------------------------------------------------------------------------------
+# Required packages
+library(lme4)
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(MuMIn)
+library(sjPlot)
+library(partR2)
+library(ncf)
+library(spdep)
+library(lmtest)
 
-# Step 2: Handle spatial autocorrelation
-# Run GAM with residuals to add as autocovariate in my model 
-residauto <- residuals(glm_long)
-modelgam <- gam(residauto ~ s(Easting, Northing), family = gaussian, data = methodA_500m)
-methodA_500m$autocov <- fitted(modelgam)
-
-# Step 3: Add autocovariate term back into dataset and standardize 
+## 1. DATA PREPARATION -------------------------------------------------------
 methodA_500m <- methodA_500m %>%
   mutate(
+    season = paste(gisid, year_id, sep = "_"),
     survey_year = factor(survey_yea),
-    duration = factor(duration),
     prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
     edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
-    #nlsi_std = scale(nlsi, center = TRUE, scale = TRUE)[,1],
-    #core_mn_std = scale(core_mn, center = TRUE, scale = TRUE)[,1],
-    qpad = offset,
-    autocov = scale(autocov, center = TRUE, scale = TRUE)[,1]
+    qpad = offset
   )
 
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
 
-modA500 <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
-                     (1 | gisid) + (1 | survey_year), 
-                   data = methodA_500m, family = binomial)
-summary(modA500)
-
-modA500_A <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + autocov +
-                     (1 | gisid) + (1 | survey_year), 
-                   data = methodA_500m, family = binomial)
+# A. Full model with interaction
+modA500int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodA_500m, family = binomial)
+residauto_int <- residuals(modA500int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodA_500m)
+methodA_500m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modA500int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodA_500m, family = binomial)
+summary(modA500int)
 summary(modA500_A)
-
-modA500_F <- glmer(occupancy ~ offset(log(qpad)) + edge_density_std + autocov +
-                       (1 | gisid) + (1 | survey_year), 
-                     data = methodA_500m, family = binomial)
 summary(modA500_F)
+summary(modA500_AF)
+model_selectionA500 <- model.sel(modA500int, modA500_A, modA500_AF, modA500_F)
+print(model_selectionA500)
+print("R2 values:")
+r.squaredGLMM(modA500int)
+r.squaredGLMM(modA500_A)
+r.squaredGLMM(modA500_F)
+r.squaredGLMM(modA500_AF)
 
-modA500_int <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std*edge_density_std + autocov +
-                       (1 | gisid) + (1 | survey_year), 
-                     data = methodA_500m, family = binomial)
-summary(modA500_int)
+# B. Habitat amount only
+modA500_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodA_500m, family = binomial)
 
-aic_table <- AIC(modA500, modA500_A, modA500_F, modA500_int)
-aic_sorted <- aic_table[order(aic_table$AIC), ]
-print(aic_sorted)
+# C. Fragmentation only
+modA500_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodA_500m, family = binomial)
 
-## B Method--------------------------------------------------------------------------------------------
-# Step 1: Initial GLM
-# Fit the GLMM
-glm_long <- glm(occupancy ~ prop_habitat_std + edge_density_std + duration +
-                  survey_year, data = methodB_500m, family = binomial)
-summary(glm_long)
+# D. Amount + fragmentation (no interaction)
+modA500_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodA_500m, family = binomial)
 
-# Step 2: Handle spatial autocorrelation
-# Run GAM with residuals to add as autocovariate in my model 
-residauto <- residuals(glm_long)
-modelgam <- gam(residauto ~ s(Easting, Northing), family = gaussian, data = methodB_500m)
-methodB_500m$autocov <- fitted(modelgam)
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionA500 <- model.sel(modA500int, modA500_A, modA500_AF, modA500_F)
+print(model_selectionA500)
+
+# Likelihood ratio test
+lrtest(modA500int, modA500_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodA_500m$Easting, methodA_500m$Northing)
+
+# Full model
+resid_int <- residuals(modA500int)
+spline_corr_int <- ncf::spline.correlog(methodA_500m$Easting, methodA_500m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modA500_A)
+spline_corr_A <- ncf::spline.correlog(methodA_500m$Easting, methodA_500m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modA500_F)
+spline_corr_F <- ncf::spline.correlog(methodA_500m$Easting, methodA_500m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modA500_AF)
+spline_corr_AF <- ncf::spline.correlog(methodA_500m$Easting, methodA_500m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modA500int), main = "Interaction Model")
+pacf(residuals(modA500_A), main = "Amount Only")
+pacf(residuals(modA500_F), main = "Fragmentation Only")
+pacf(residuals(modA500_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
 
 
-# Step 3: Add autocovariate term back into dataset and standardize 
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modA500int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodA_500m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modA500int, type = "int", mdrt.values = "quart")
+plot_model(modA500int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modA500int, modA500_A, modA500_AF, modA500_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modA500int)
+r.squaredGLMM(modA500_A)
+r.squaredGLMM(modA500_F)
+r.squaredGLMM(modA500_AF)
+
+
+# B Method--------------------------------------------------------------------------------------------
+
+## 1. DATA PREPARATION -------------------------------------------------------
 methodB_500m <- methodB_500m %>%
   mutate(
-    # Factorize categorical variables
+    season = paste(gisid, year_id, sep = "_"),
     survey_year = factor(survey_yea),
-    duration = factor(duration),
-    # Standardize continuous landscape metrics
-    # Using scale() with center and scale parameters for more control
     prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
     edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
-    #nlsi_std = scale(nlsi, center = TRUE, scale = TRUE)[,1],
-    #core_mn_std = scale(core_mn, center = TRUE, scale = TRUE)[,1],
-    qpad = offset,
-    autocov = scale(autocov, center = TRUE, scale = TRUE)[,1]
+    qpad = offset
   )
 
-modB500 <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + edge_density_std + autocov +
-                     (1 | gisid) + (1 | survey_year), 
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modB500int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodB_500m, family = binomial)
+residauto_int <- residuals(modB500int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodB_500m)
+methodB_500m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modB500int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodB_500m, family = binomial)
+
+# B. Habitat amount only
+modB500_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
                    data = methodB_500m, family = binomial)
-summary(modB500)
 
-modB500_A <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std + autocov +
-                       (1 | gisid) + (1 | survey_year), 
-                     data = methodB_500m, family = binomial)
-summary(modB500_A)
+# C. Fragmentation only
+modB500_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodB_500m, family = binomial)
 
-modB500_F <- glmer(occupancy ~ offset(log(qpad)) + edge_density_std + autocov +
-                       (1 | gisid) + (1 | survey_year), 
-                     data = methodB_500m, family = binomial)
-summary(modB500_F)
+# D. Amount + fragmentation (no interaction)
+modB500_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodB_500m, family = binomial)
 
-modB500_int <- glmer(occupancy ~ offset(log(qpad)) + prop_habitat_std*edge_density_std + autocov +
-                         (1 | gisid) + (1 | survey_year), 
-                       data = methodB_500m, family = binomial)
-summary(modB500_int)
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
 
-aic_table <- AIC(modB500, modB500_A, modB500_F, modB500_int)
-aic_sortedB <- aic_table[order(aic_table$AIC), ]
-print(aic_sortedB)
+# AIC model selection
+model_selectionB500 <- model.sel(modB500int, modB500_A, modB500_AF, modB500_F)
+print(model_selectionB500)
+
+# Likelihood ratio test
+lrtest(modB500int, modB500_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodB_500m$Easting, methodB_500m$Northing)
+
+# Full model
+resid_int <- residuals(modB500int)
+spline_corr_int <- ncf::spline.correlog(methodB_500m$Easting, methodB_500m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modB500_A)
+spline_corr_A <- ncf::spline.correlog(methodB_500m$Easting, methodB_500m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modB500_F)
+spline_corr_F <- ncf::spline.correlog(methodB_500m$Easting, methodB_500m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modB500_AF)
+spline_corr_AF <- ncf::spline.correlog(methodB_500m$Easting, methodB_500m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modB500int), main = "Interaction Model")
+pacf(residuals(modB500_A), main = "Amount Only")
+pacf(residuals(modB500_F), main = "Fragmentation Only")
+pacf(residuals(modB500_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modB500int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodB_500m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modB500int, type = "int", mdrt.values = "quart")
+plot_model(modB500int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modB500int, modB500_A, modB500_AF, modB500_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modB500int)
+r.squaredGLMM(modB500_A)
+r.squaredGLMM(modB500_F)
+r.squaredGLMM(modB500_AF)
+
 
 
 # C Method------------------------------------------------------------------------------------------------- 
-# Step 1: Initial GLM
-# Fit the GLMM
-modC500int_NOxy <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
-                      (1 | gisid / season) + (1 | survey_year),
-                    data = methodC_500m, family = binomial)
-summary(modC500int_NOxy)
 
-# Step 2: Handle spatial autocorrelation
-# Run GAM with residuals to add as autocovariate in my model 
-residauto <- residuals(modC500int_NOxy)
-modelgam <- gam(residauto ~ s(Easting, Northing), family = gaussian, data = methodC_500m)
-methodC_500m$autocov <- fitted(modelgam)
-
-
-# Step 3: Add autocovariate term back into dataset and standardize 
+## 1. DATA PREPARATION -------------------------------------------------------
 methodC_500m <- methodC_500m %>%
   mutate(
-    survey_year = factor(survey_yea),
     season = paste(gisid, year_id, sep = "_"),
-    duration = factor(duration),
+    survey_year = factor(survey_yea),
     prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
     edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
-    #nlsi_std = scale(nlsi, center = TRUE, scale = TRUE)[,1],
-    #core_mn_std = scale(core_mn, center = TRUE, scale = TRUE)[,1],
-    qpad = offset,
-    autocov = scale(autocov, center = TRUE, scale = TRUE)[,1]
+    qpad = offset
   )
 
-modC500int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + autocov + scale(as.numeric(survey_year)) +
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modC500int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodC_500m, family = binomial)
+residauto_int <- residuals(modC500int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodC_500m)
+methodC_500m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modC500int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_500m, family = binomial)
+
+# B. Habitat amount only
+modC500_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
                      (1 | gisid / season) + (1 | survey_year), 
                    data = methodC_500m, family = binomial)
-summary(modC500int)
 
-
-# Habitat amt only 
-modC500_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + autocov +
+# C. Fragmentation only
+modC500_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
                      (1 | gisid / season) + (1 | survey_year), 
                    data = methodC_500m, family = binomial)
-summary(modC500_A)
 
+# D. Amount + fragmentation (no interaction)
+modC500_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_500m, family = binomial)
 
-# Frag only 
-modC500_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + autocov +
-                       (1 | gisid / season) + (1 | survey_year), 
-                     data = methodC_500m, family = binomial)
-summary(modC500_F)
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
 
-# amt + frag 
-modC500_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + autocov +
-                         (1 | gisid / season) + (1 | survey_year), 
-                       data = methodC_500m, family = binomial)
-summary(modC500_AF)
+# AIC model selection
+model_selectionC500 <- model.sel(modC500int, modC500_A, modC500_AF, modC500_F)
+print(model_selectionC500)
 
-model.sel(modC500int, modC500_A, modC500_AF, modC500_F)
-  
-plot_models(modC500int, modC500_A, modC500_AF, modC500_F, transform = NULL) # can make this pretty and use it as supp mat 
-# Forest coefficient plots for the four model varainats showing standardized effect sizes in the link scale 
-
-# Marginal model predictions (response curves)
-plot_model(modC500int, type = "int", mdrt.values = "quart")
-
-plot_model(modC500int, type = "pred")
-
-library(lmtest)
-
+# Likelihood ratio test
 lrtest(modC500int, modC500_AF)
 
-# Variance partitioning 
-library(partR2)
-library(parallel)
-library(future)
-library(furrr)
-parallel::detectCores()
-plan(multisession, workers=18)
-glmm.hp(modC500_AF)
-?partR2
-summary(modC500int)
-r2part <- partR2(
-  modC500int,
-  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"),
-  data = methodC_500m,
-  R2_type = "marginal",
-  max_level = NULL,
-  nboot = 99,
-  CI = 0.95,
-  parallel = T,
-  expct = "meanobs",
-  olre = F,
-  partbatch = NULL,
-  allow_neg_r2 = FALSE
-)
-(y <- forestplot(r2part, type = c("R2")))
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
 
-# Calculate R2 for mixed models (both marginal and conditional)
-r.squaredGLMM(modA500)
-r.squaredGLMM(modB500)
-r.squaredGLMM(modC500)
-
-
-
-# spatial autocorrelation test 
-library(ncf)
-install.packages("pgirmess")
-library(pgirmess)
-library(spdep) 
-resid <- residuals(modC500int)
-residnospace <- residuals(modC500_NOxy)
+# Spatial autocorrelation checks for each model
 coord <- cbind(methodC_500m$Easting, methodC_500m$Northing)
 
-correlog_noXY <- pgirmess::correlog(coords = coord, z = residnospace, method = "Moran", nbclass = 10)
-spline_corr_noXY <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing, 
-                                    residnospace, resamp = 100, type = "boot")
-plot(spline_corr_noXY, ylim = c(-0.2, 0.2))
-correlog <- pgirmess::correlog(coords = coord, z = resid, method = "Moran", nbclass = 10)
-plot(correlog)
-spline_corr <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing, 
-                                         resid, resamp = 100, type = "boot")
+# Full model
+resid_int <- residuals(modC500int)
+spline_corr_int <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
 
-plot(spline_corr, ylim = c(-0.2, 0.2))
+# Amount only
+resid_A <- residuals(modC500_A)
+spline_corr_A <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modC500_F)
+spline_corr_F <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modC500_AF)
+spline_corr_AF <- ncf::spline.correlog(methodC_500m$Easting, methodC_500m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modC500int), main = "Interaction Model")
+pacf(residuals(modC500_A), main = "Amount Only")
+pacf(residuals(modC500_F), main = "Fragmentation Only")
+pacf(residuals(modC500_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
 
 
-# temporal autocorrelation checks 
-pacf(residuals(modC500int))
+## 6. VARIANCE PARTITIONING ------------------------------------------------
 
-# Diagnostics ---------------------------------------------------------------------------------------- 
-# Function to perform comprehensive GLMM diagnostics
-check_glmm <- function(model, modelname = "Model") {
-  
-  # 1. Create DHARMa residuals
-  sim_resid <- simulateResiduals(model)
-  
-  # 2. Basic DHARMa diagnostic plots
-  plot(sim_resid)
-  
-  # 3. Check for zero-inflation
-  testZeroInflation(sim_resid)
-  
-  # 4. Check for dispersion
-  testDispersion(sim_resid)
-  
-  # 5. Spatial autocorrelation in residuals
-  acf(residuals(model), main = paste(modelname, "- ACF of Residuals"))
-  
-  # 7. Check variance inflation factors for fixed effects
-  print("Variance Inflation Factors:")
-  print(check_collinearity(model))
-  
-  # 8. Check model convergence
-  print("Model convergence check:")
-  print(check_convergence(model))
-  
-  # 9. Check singularity
-  print("Singularity check:")
-  print(check_singularity(model))
-  
-  # 10. Performance metrics
-  print("Performance metrics:")
-  print(model_performance(model))
-  
-}
+# Set up parallel processing
+plan(multisession, workers = 18)
 
-# Usage example for your models:
-# Individual model checks
-check_glmm(modA500, "Model A")
-check_glmm(modB500, "Model B")
-check_glmm(modC500, "Model C")
+# Partition variance for full model
+r2part <- partR2(
+  modC500int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodC_500m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modC500int, type = "int", mdrt.values = "quart")
+plot_model(modC500int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modC500int, modC500_A, modC500_AF, modC500_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modC500int)
+r.squaredGLMM(modC500_A)
+r.squaredGLMM(modC500_F)
+r.squaredGLMM(modC500_AF)
+
+
+
+# 1000m Scale -----------------------------------------------------------------------------------------------------------------
+# Load datasets 
+methodA_1000m <- read.csv("1_Data/1000m/methodA_glmmdata.csv", header = T)
+methodB_1000m <- read.csv("1_Data/1000m/methodB_glmmdata.csv", header = T)
+methodC_1000m <- read.csv("1_Data/1000m/methodC_glmmdata.csv", header = T)
+
+# Fit the logistic regression model
+
+# Step 1: Fit the GLM model with just habitat amount (logistic regression)
+glm_model <- glm(occupancy ~ habitat_amount, data = full_data, family = binomial)
+
+# Simulate residuals using DHARMa
+
+# Step 1: Simulate residuals
+residuals_sim <- simulateResiduals(fittedModel = glm_model)
+
+# Step 2: Plot residual diagnostics
+plot(residuals_sim)
+
+# Step 3: Test for spatial autocorrelation 
+# Create a spatial weights matrix
+coords <- full_data %>% select(Easting, Northing)
+neighbors <- dnearneigh(as.matrix(coords), d1 = 0, d2 = quantile(dist(coords), 0.1)) # 10th percentile distance
+weights <- nb2listw(neighbors, style = "W")
+
+# Perform Moran's I test for residuals
+moran_test <- moran.test(residuals_sim$scaledResiduals, weights)
+print(moran_test)
+
+
+# try modelling the temporal trend with splines 
+library(mgcv)
+gam_model <- gam(
+  occupancy ~ s(year, bs = "re") + habitat_amount_std + edge_density_std + Easting,
+  family = binomial,
+  data = full_data
+)
+
+# Fit a mixed-effects logistic regression model
+mixed_model <- glm(
+  occupancy ~ habitat_amount_std + edge_density_std + Easting,
+  data = full_data,
+  family = binomial
+)
+
+# Summary of the model
+summary(mixed_model)
+
+# Simulate residuals using DHARMa
+residuals_sim <- simulateResiduals(fittedModel = mixed_model)
+
+# Plot DHARMa residuals for diagnostics
+plot(residuals_sim)
+
+# Create a spatial weights matrix
+coords <- full_data %>% select(Easting, Northing)
+neighbors <- dnearneigh(as.matrix(coords), d1 = 0, d2 = quantile(dist(coords), 0.1))
+weights <- nb2listw(neighbors, style = "W")
+
+
+# Run GAM with residuals to add as autocovariate in my model 
+residauto <- residuals(mixed_model)
+modelgam <- gam(resid ~ s(Easting, Northing), family = gaussian, data = full_data)
+plot(modelgam)
+summary(modelgam)
+outofcov <- fitted(modelgam)
+
+# Moran's I Test 
+moran_test <- moran.test(residauto, weights)
+print(moran_test)
+plot(full_data$Easting, residauto)
+plot(full_data$Northing, residauto)
+
+
+
+# A Method--------------------------------------------------------------------------------------------
+# Required packages
+library(lme4)
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(MuMIn)
+library(sjPlot)
+library(partR2)
+library(ncf)
+library(spdep)
+library(lmtest)
+
+## 1. DATA PREPARATION -------------------------------------------------------
+methodA_1000m <- methodA_1000m %>%
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modA1000int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodA_1000m, family = binomial)
+residauto_int <- residuals(modA1000int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodA_1000m)
+methodA_1000m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modA1000int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodA_1000m, family = binomial)
+summary(modA1000int)
+# B. Habitat amount only
+modA1000_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodA_1000m, family = binomial)
+summary(modA1000_A)
+# C. Fragmentation only
+modA1000_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodA_1000m, family = binomial)
+summary(modA1000_F)
+# D. Amount + fragmentation (no interaction)
+modA1000_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodA_1000m, family = binomial)
+summary(modA1000_AF)
+
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionA1000 <- model.sel(modA1000int, modA1000_A, modA1000_AF, modA1000_F)
+print(model_selectionA1000)
+
+# Likelihood ratio test
+lrtest(modA1000int, modA1000_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodA_1000m$Easting, methodA_1000m$Northing)
+
+# Full model
+resid_int <- residuals(modA1000int)
+spline_corr_int <- ncf::spline.correlog(methodA_1000m$Easting, methodA_1000m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modA1000_A)
+spline_corr_A <- ncf::spline.correlog(methodA_1000m$Easting, methodA_1000m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modA1000_F)
+spline_corr_F <- ncf::spline.correlog(methodA_1000m$Easting, methodA_1000m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modA1000_AF)
+spline_corr_AF <- ncf::spline.correlog(methodA_1000m$Easting, methodA_1000m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modA1000int), main = "Interaction Model")
+pacf(residuals(modA1000_A), main = "Amount Only")
+pacf(residuals(modA1000_F), main = "Fragmentation Only")
+pacf(residuals(modA1000_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modA1000int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodA_1000m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modA1000int, type = "int", mdrt.values = "quart")
+plot_model(modA1000int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modA1000int, modA1000_A, modA1000_AF, modA1000_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modA1000int)
+r.squaredGLMM(modA1000_A)
+r.squaredGLMM(modA1000_F)
+r.squaredGLMM(modA1000_AF)
+
+# B Method--------------------------------------------------------------------------------------------
+
+## 1. DATA PREPARATION -------------------------------------------------------
+methodB_1000m <- methodB_1000m %>%
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modB1000int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodB_1000m, family = binomial)
+residauto_int <- residuals(modB1000int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodB_1000m)
+methodB_1000m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modB1000int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodB_1000m, family = binomial)
+summary(modB1000int)
+# B. Habitat amount only
+modB1000_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodB_1000m, family = binomial)
+
+# C. Fragmentation only
+modB1000_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodB_1000m, family = binomial)
+
+# D. Amount + fragmentation (no interaction)
+modB1000_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodB_1000m, family = binomial)
+
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionB1000 <- model.sel(modB1000int, modB1000_A, modB1000_AF, modB1000_F)
+print(model_selectionB1000)
+
+# Likelihood ratio test
+lrtest(modB1000int, modB1000_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodB_1000m$Easting, methodB_1000m$Northing)
+
+# Full model
+resid_int <- residuals(modB1000int)
+spline_corr_int <- ncf::spline.correlog(methodB_1000m$Easting, methodB_1000m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modB1000_A)
+spline_corr_A <- ncf::spline.correlog(methodB_1000m$Easting, methodB_1000m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modB1000_F)
+spline_corr_F <- ncf::spline.correlog(methodB_1000m$Easting, methodB_1000m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modB1000_AF)
+spline_corr_AF <- ncf::spline.correlog(methodB_1000m$Easting, methodB_1000m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modB1000int), main = "Interaction Model")
+pacf(residuals(modB1000_A), main = "Amount Only")
+pacf(residuals(modB1000_F), main = "Fragmentation Only")
+pacf(residuals(modB1000_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modB1000int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodB_1000m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modB1000int, type = "int", mdrt.values = "quart")
+plot_model(modB1000int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modB1000int, modB1000_A, modB1000_AF, modB1000_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modB1000int)
+r.squaredGLMM(modB1000_A)
+r.squaredGLMM(modB1000_F)
+r.squaredGLMM(modB1000_AF)
+
+
+
+# C Method------------------------------------------------------------------------------------------------- 
+
+## 1. DATA PREPARATION -------------------------------------------------------
+methodC_1000m <- methodC_1000m %>%
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modC1000int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodC_1000m, family = binomial)
+residauto_int <- residuals(modC1000int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodC_1000m)
+methodC_1000m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modC1000int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_1000m, family = binomial)
+summary(modC1000int)
+# B. Habitat amount only
+modC1000_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodC_1000m, family = binomial)
+
+# C. Fragmentation only
+modC1000_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodC_1000m, family = binomial)
+
+# D. Amount + fragmentation (no interaction)
+modC1000_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_1000m, family = binomial)
+summary(modC1000_AF)
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionC1000 <- model.sel(modC1000int, modC1000_A, modC1000_AF, modC1000_F)
+print(model_selectionC1000)
+
+# Likelihood ratio test
+lrtest(modC1000int, modC1000_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodC_1000m$Easting, methodC_1000m$Northing)
+
+# Full model
+resid_int <- residuals(modC1000int)
+spline_corr_int <- ncf::spline.correlog(methodC_1000m$Easting, methodC_1000m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modC1000_A)
+spline_corr_A <- ncf::spline.correlog(methodC_1000m$Easting, methodC_1000m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modC1000_F)
+spline_corr_F <- ncf::spline.correlog(methodC_1000m$Easting, methodC_1000m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modC1000_AF)
+spline_corr_AF <- ncf::spline.correlog(methodC_1000m$Easting, methodC_1000m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modC1000int), main = "Interaction Model")
+pacf(residuals(modC1000_A), main = "Amount Only")
+pacf(residuals(modC1000_F), main = "Fragmentation Only")
+pacf(residuals(modC1000_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modC1000int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodC_1000m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modC1000int, type = "int", mdrt.values = "quart")
+plot_model(modC1000int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modC1000int, modC1000_A, modC1000_AF, modC1000_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modC1000int)
+r.squaredGLMM(modC1000_A)
+r.squaredGLMM(modC1000_F)
+r.squaredGLMM(modC1000_AF)
+
+
+
+
+# 150m Scale --------------------------------------------------------------------------------------------
+# A Method--------------------------------------------------------------------------------------------
+
+## 1. DATA PREPARATION -------------------------------------------------------
+methodA_150m <- methodA_150m %>%
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modA150int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                            (1 | gisid / season) + (1 | survey_year),
+                          data = methodA_150m, family = binomial)
+residauto_int <- residuals(modA150int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodA_150m)
+methodA_150m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modA150int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                       spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                     data = methodA_150m, family = binomial)
+summary(modA150int)
+# B. Habitat amount only
+modA150_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                      (1 | gisid / season) + (1 | survey_year), 
+                    data = methodA_150m, family = binomial)
+summary(modA150_A)
+# C. Fragmentation only
+modA150_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                      (1 | gisid / season) + (1 | survey_year), 
+                    data = methodA_150m, family = binomial)
+summary(modA150_F)
+# D. Amount + fragmentation (no interaction)
+modA150_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                       spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                     data = methodA_150m, family = binomial)
+summary(modA150_AF)
+
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionA150 <- model.sel(modA150int, modA150_A, modA150_AF, modA150_F)
+print(model_selectionA150)
+
+# Likelihood ratio test
+lrtest(modA150int, modA150_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodA_150m$Easting, methodA_150m$Northing)
+
+# Full model
+resid_int <- residuals(modA150int)
+spline_corr_int <- ncf::spline.correlog(methodA_150m$Easting, methodA_150m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modA150_A)
+spline_corr_A <- ncf::spline.correlog(methodA_150m$Easting, methodA_150m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modA150_F)
+spline_corr_F <- ncf::spline.correlog(methodA_150m$Easting, methodA_150m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modA150_AF)
+spline_corr_AF <- ncf::spline.correlog(methodA_150m$Easting, methodA_150m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modA150int), main = "Interaction Model")
+pacf(residuals(modA150_A), main = "Amount Only")
+pacf(residuals(modA150_F), main = "Fragmentation Only")
+pacf(residuals(modA150_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modA150int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodA_150m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modA150int, type = "int", mdrt.values = "quart")
+plot_model(modA150int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modA150int, modA150_A, modA150_AF, modA150_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modA150int)
+r.squaredGLMM(modA150_A)
+r.squaredGLMM(modA150_F)
+r.squaredGLMM(modA150_AF)
+
+
+# B Method--------------------------------------------------------------------------------------------
+
+## 1. DATA PREPARATION -------------------------------------------------------
+methodB_150m <- methodB_150m %>%
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modB150int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                            (1 | gisid / season) + (1 | survey_year),
+                          data = methodB_150m, family = binomial)
+residauto_int <- residuals(modB150int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodB_150m)
+methodB_150m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modB150int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                       spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                     data = methodB_150m, family = binomial)
+summary(modB150int)
+# B. Habitat amount only
+modB150_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                      (1 | gisid / season) + (1 | survey_year), 
+                    data = methodB_150m, family = binomial)
+
+# C. Fragmentation only
+modB150_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                      (1 | gisid / season) + (1 | survey_year), 
+                    data = methodB_150m, family = binomial)
+
+# D. Amount + fragmentation (no interaction)
+modB150_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                       spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                     data = methodB_150m, family = binomial)
+summary(modB150_AF)
+
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionB150 <- model.sel(modB150int, modB150_A, modB150_AF, modB150_F)
+print(model_selectionB150)
+
+# Likelihood ratio test
+lrtest(modB150int, modB150_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodB_150m$Easting, methodB_150m$Northing)
+
+# Full model
+resid_int <- residuals(modB150int)
+spline_corr_int <- ncf::spline.correlog(methodB_150m$Easting, methodB_150m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modB150_A)
+spline_corr_A <- ncf::spline.correlog(methodB_150m$Easting, methodB_150m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modB150_F)
+spline_corr_F <- ncf::spline.correlog(methodB_150m$Easting, methodB_150m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modB150_AF)
+spline_corr_AF <- ncf::spline.correlog(methodB_150m$Easting, methodB_150m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modB150int), main = "Interaction Model")
+pacf(residuals(modB150_A), main = "Amount Only")
+pacf(residuals(modB150_F), main = "Fragmentation Only")
+pacf(residuals(modB150_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modB150int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodB_150m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modB150int, type = "int", mdrt.values = "quart")
+plot_model(modB150int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modB150int, modB150_A, modB150_AF, modB150_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modB150int)
+r.squaredGLMM(modB150_A)
+r.squaredGLMM(modB150_F)
+r.squaredGLMM(modB150_AF)
+
+
+
+# C Method------------------------------------------------------------------------------------------------- 
+
+## 1. DATA PREPARATION -------------------------------------------------------
+methodC_150m <- methodC_150m %>%
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+
+## 2. MODEL FITTING WITH MODEL-SPECIFIC SPATIAL TERMS ------------------------
+
+# A. Full model with interaction
+modC150int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                            (1 | gisid / season) + (1 | survey_year),
+                          data = methodC_150m, family = binomial)
+residauto_int <- residuals(modC150int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodC_150m)
+methodC_150m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modC150int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                       spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                     data = methodC_150m, family = binomial)
+summary(modC150int)
+
+# B. Habitat amount only
+modC150_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                      (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_150m, family = binomial)
+summary(modC150_A)
+
+# C. Fragmentation only
+modC150_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                      (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_150m, family = binomial)
+summary(modC150_F)
+
+# D. Amount + fragmentation (no interaction)
+modC150_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                       spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                     data = methodC_150m, family = binomial)
+summary(modC150_AF)
+## 3. MODEL SELECTION AND COMPARISON ----------------------------------------
+
+# AIC model selection
+model_selectionC150 <- model.sel(modC150int, modC150_A, modC150_AF, modC150_F)
+print(model_selectionC150)
+
+# Likelihood ratio test
+lrtest(modC150int, modC150_AF)
+
+## 4. MODEL DIAGNOSTICS ----------------------------------------------------
+
+# Spatial autocorrelation checks for each model
+coord <- cbind(methodC_150m$Easting, methodC_150m$Northing)
+
+# Full model
+resid_int <- residuals(modC150int)
+spline_corr_int <- ncf::spline.correlog(methodC_150m$Easting, methodC_150m$Northing,
+                                        resid_int, resamp = 10, type = "boot") # change to 10 from 100 to make it faster 
+
+# Amount only
+resid_A <- residuals(modC150_A)
+spline_corr_A <- ncf::spline.correlog(methodC_150m$Easting, methodC_150m$Northing,
+                                      resid_A, resamp = 10, type = "boot")
+
+# Fragmentation only
+resid_F <- residuals(modC150_F)
+spline_corr_F <- ncf::spline.correlog(methodC_150m$Easting, methodC_150m$Northing,
+                                      resid_F, resamp = 10, type = "boot")
+
+# Amount + Fragmentation
+resid_AF <- residuals(modC150_AF)
+spline_corr_AF <- ncf::spline.correlog(methodC_150m$Easting, methodC_150m$Northing,
+                                       resid_AF, resamp = 10, type = "boot")
+
+# Plot spatial correlograms
+par(mfrow = c(2,2))
+plot(spline_corr_int, ylim = c(-0.2, 0.2), main = "Interaction Model")
+plot(spline_corr_A, ylim = c(-0.2, 0.2), main = "Amount Only")
+plot(spline_corr_F, ylim = c(-0.2, 0.2), main = "Fragmentation Only")
+plot(spline_corr_AF, ylim = c(-0.2, 0.2), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+# Temporal autocorrelation checks
+par(mfrow = c(2,2))
+pacf(residuals(modC150int), main = "Interaction Model")
+pacf(residuals(modC150_A), main = "Amount Only")
+pacf(residuals(modC150_F), main = "Fragmentation Only")
+pacf(residuals(modC150_AF), main = "Amount + Fragmentation")
+par(mfrow = c(1,1))
+
+
+## 6. VARIANCE PARTITIONING ------------------------------------------------
+
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modC150int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodC_150m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Plot variance partitioning results
+forestplot(r2part, type = c("R2"))
+
+## 7. VISUALIZATION -------------------------------------------------------
+
+# Effect plots for best model (assuming interaction model)
+plot_model(modC150int, type = "int", mdrt.values = "quart")
+plot_model(modC150int, type = "pred")
+
+# Coefficient plots for model comparison
+plot_models(modC150int, modC150_A, modC150_AF, modC150_F, transform = NULL)
+
+# Calculate R2 for all models
+print("R2 values:")
+r.squaredGLMM(modC150int)
+r.squaredGLMM(modC150_A)
+r.squaredGLMM(modC150_F)
+r.squaredGLMM(modC150_AF)
+
+
+
+# Compare all models-----------------------------------------------------------------------
+# 500 m
+# Method A
+summary(modA500int)
+summary(modA500_A)
+summary(modA500_F)
+summary(modA500_AF)
+model_selectionA500 <- model.sel(modA500int, modA500_A, modA500_AF, modA500_F)
+print(model_selectionA500)
+print("R2 values:")
+r.squaredGLMM(modA500int)
+r.squaredGLMM(modA500_A)
+r.squaredGLMM(modA500_F)
+r.squaredGLMM(modA500_AF)
+# Method B
+summary(modB500int)
+summary(modB500_A)
+summary(modB500_F)
+summary(modB500_AF)
+model_selectionB500 <- model.sel(modB500int, modB500_A, modB500_AF, modB500_F)
+print(model_selectionB500)
+print("R2 values:")
+r.squaredGLMM(modB500int)
+r.squaredGLMM(modB500_A)
+r.squaredGLMM(modB500_F)
+r.squaredGLMM(modB500_AF)
+# Method C
+summary(modC500int)
+summary(modC500_A)
+summary(modC500_F)
+summary(modC500_AF)
+model_selectionC500 <- model.sel(modC500int, modC500_A, modC500_AF, modC500_F)
+print(model_selectionC500)
+print("R2 values:")
+r.squaredGLMM(modC500int)
+r.squaredGLMM(modC500_A)
+r.squaredGLMM(modC500_F)
+r.squaredGLMM(modC500_AF)
+
+# 1000 m
+# Method A
+summary(modA1000int)
+summary(modA1000_A)
+summary(modA1000_F)
+summary(modA1000_AF)
+model_selectionA1000 <- model.sel(modA1000int, modA1000_A, modA1000_AF, modA1000_F)
+print(model_selectionA1000)
+print("R2 values:")
+r.squaredGLMM(modA1000int)
+r.squaredGLMM(modA1000_A)
+r.squaredGLMM(modA1000_F)
+r.squaredGLMM(modA1000_AF)
+# Method B
+summary(modB1000int)
+summary(modB1000_A)
+summary(modB1000_F)
+summary(modB1000_AF)
+model_selectionB1000 <- model.sel(modB1000int, modB1000_A, modB1000_AF, modB1000_F)
+print(model_selectionB1000)
+print("R2 values:")
+r.squaredGLMM(modB1000int)
+r.squaredGLMM(modB1000_A)
+r.squaredGLMM(modB1000_F)
+r.squaredGLMM(modB1000_AF)
+# Method C
+summary(modC1000int)
+summary(modC1000_A)
+summary(modC1000_F)
+summary(modC1000_AF)
+model_selectionC1000 <- model.sel(modC1000int, modC1000_A, modC1000_AF, modC1000_F)
+print(model_selectionC1000)
+print("R2 values:")
+r.squaredGLMM(modC1000int)
+r.squaredGLMM(modC1000_A)
+r.squaredGLMM(modC1000_F)
+r.squaredGLMM(modC1000_AF)
+
+# 150 m
+# Method A
+summary(modA150int)
+summary(modA150_A)
+summary(modA150_F)
+summary(modA150_AF)
+model_selectionA150 <- model.sel(modA150int, modA150_A, modA150_AF, modA150_F)
+print(model_selectionA150)
+print("R2 values:")
+r.squaredGLMM(modA150int)
+r.squaredGLMM(modA150_A)
+r.squaredGLMM(modA150_F)
+r.squaredGLMM(modA150_AF)
+# Method B
+summary(modB150int)
+summary(modB150_A)
+summary(modB150_F)
+summary(modB150_AF)
+model_selectionB150 <- model.sel(modB150int, modB150_A, modB150_AF, modB150_F)
+print(model_selectionB150)
+print("R2 values:")
+r.squaredGLMM(modB150int)
+r.squaredGLMM(modB150_A)
+r.squaredGLMM(modB150_F)
+r.squaredGLMM(modB150_AF)
+# Method C
+summary(modC150int)
+summary(modC150_A)
+summary(modC150_F)
+summary(modC150_AF)
+model_selectionC150 <- model.sel(modC150int, modC150_A, modC150_AF, modC150_F)
+print(model_selectionC150)
+print("R2 values:")
+r.squaredGLMM(modC150int)
+r.squaredGLMM(modC150_A)
+r.squaredGLMM(modC150_F)
+r.squaredGLMM(modC150_AF)
 
 
 
