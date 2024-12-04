@@ -51,7 +51,7 @@ We accounted for spatial autocorrelation by:
 ```{r load-data, include=FALSE}
 
 getwd()
-methodC_500m <- read.csv("C:/Users/hartt/Documents/Chapter 2/Chapter 2 Analysis/HabitatFragmentation_GLMM/1_Data/500m/methodcdata_processed.csv")
+methodC_500m <- read.csv("C:/Users/hartt/Documents/Chapter 2/Chapter 2 Analysis/HabitatFragmentation_GLMM/1_Data/500m/methodC_glmmdata.csv")
 methodC_500m %>% 
   mutate(
     season = paste(gisid, year_id, sep = "_"),
