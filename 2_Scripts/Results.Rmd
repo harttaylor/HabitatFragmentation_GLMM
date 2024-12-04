@@ -1,0 +1,204 @@
+---
+title: "Habitat amount vs fragmentation effects on BTNW occupancy"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  word_document: 
+  reference_docx: C:\Users\hartt\Documents\Chapter 1\Writing\Chpt1_IntroMethods_29Nov2023.docx
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Load required packages
+library(lme4)
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(MuMIn)
+library(sjPlot)
+library(partR2)
+library(knitr)
+library(future)
+```
+
+## Methods
+
+### Statistical Analysis
+
+We used generalized linear mixed models (GLMMs) to analyze BTNW occupancy in relation to habitat amount and fragmentation. We constructed four candidate models with increasing complexity:
+
+1. Habitat amount only
+2. Fragmentation only (edge density)
+3. Additive effects of habitat amount and fragmentation
+4. Interactive effects of habitat amount and fragmentation
+
+All models included:
+
+- Offset term to account for detection probability
+- Spatial autocorrelation term (specific to each model structure)
+- Random effects for site and season nested within site
+- All continuous predictors were standardized (mean = 0, SD = 1)
+
+We accounted for spatial autocorrelation by:
+
+1. Fitting a base model without spatial terms for our most complex model, including the interaction between habitat amount and edge density
+2. Extracting residuals and fitting a Generalized Additive Model (GAM) with spatial smoothing
+3. Including the fitted values from the GAM as a spatial autocovariate in our candidate models. This successfully controlled spatial dependencies in the data (Supplementary Material).
+
+```{r load-data, include=FALSE}
+
+getwd()
+methodC_500m <- read.csv("C:/Users/hartt/Documents/Chapter 2/Chapter 2 Analysis/HabitatFragmentation_GLMM/1_Data/500m/methodcdata_processed.csv")
+methodC_500m %>% 
+  mutate(
+    season = paste(gisid, year_id, sep = "_"),
+    survey_year = factor(survey_yea),
+    prop_habitat_std = scale(prop_habitat, center = TRUE, scale = TRUE)[,1],
+    edge_density_std = scale(edge_density, center = TRUE, scale = TRUE)[,1],
+    qpad = offset
+  )
+```
+
+```{r fit-models, include=FALSE}
+# A. Full model with interaction
+modC500int_base <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std +
+                           (1 | gisid / season) + (1 | survey_year),
+                         data = methodC_500m, family = binomial)
+residauto_int <- residuals(modC500int_base)
+modelgam_int <- gam(residauto_int ~ s(Easting, Northing), family = gaussian, data = methodC_500m)
+methodC_500m$spatial_autocov_int <- scale(fitted(modelgam_int))[,1]
+modC500int <- glmer(occupancy ~ offset(qpad) + prop_habitat_std * edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_500m, family = binomial)
+
+# B. Habitat amount only
+modC500_A <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodC_500m, family = binomial)
+
+# C. Fragmentation only
+modC500_F <- glmer(occupancy ~ offset(qpad) + edge_density_std + spatial_autocov_int +
+                     (1 | gisid / season) + (1 | survey_year), 
+                   data = methodC_500m, family = binomial)
+
+# D. Amount + fragmentation (no interaction)
+modC500_AF <- glmer(occupancy ~ offset(qpad) + prop_habitat_std + edge_density_std + 
+                      spatial_autocov_int + (1 | gisid / season) + (1 | survey_year), 
+                    data = methodC_500m, family = binomial)
+
+```
+
+## Results
+
+### Model Selection
+
+```{r}
+# Model selection table
+selection_table <- model.sel(modC500int, modC500_A, modC500_AF, modC500_F)
+kable(selection_table, 
+      caption = "Model selection results comparing habitat amount and fragmentation effects. Models ranked by AICc.")
+```
+
+### Interaction Effects
+
+```{r, fig.width=7, fig.height=5}
+# Interaction plot
+plot_model(modC500int, type = "int", mdrt.values = "quart",
+            axis.title = c("Habitat Amount", "Predicted Occupancy"),
+            legend.title = "Edge Density") +
+    theme_bw()
+```
+
+The relationship between habitat amount and occupancy [varies/does not vary] with the level of fragmentation, as indicated by the significant interaction term (β = -0.412, SE = 0.181, p = 0.023).
+
+### Model Coefficients 
+
+```{r, fig.width=8, fig.height=6}
+# Coefficient plot comparing models
+plot_models(modC500int, modC500_A, modC500_AF, modC500_F, 
+           transform = NULL,
+           axis.labels = c("Spatial Autocovariate_F", "Spatial Autocovariate_A+F",
+                          "Spatial Autocovariate_A",
+                          "Proportion Habitat × Edge Density","Spatial Autocovariate_A*F",
+                          "Edge Density","Proportion Habitat"),
+           m.labels = c("Interactive", "Amount Only", 
+                       "Additive", "Fragmentation Only"),
+           title = "Standardized Effect Sizes") +
+  theme_bw()
+```
+
+### Variance Partitioning 
+
+```{r, fig.width=6, fig.height=4}
+# Set up parallel processing
+plan(multisession, workers = 18)
+
+# Partition variance for full model
+r2part <- partR2(
+  modC500int,
+  partvars = c("prop_habitat_std", "edge_density_std", "prop_habitat_std:edge_density_std"), # have to manually plot these results to only include the four model combinations 
+  data = methodC_500m,
+  R2_type = "marginal",
+  nboot = 99,
+  CI = 0.95,
+  parallel = TRUE
+)
+
+# Variance partitioning plot
+forestplot(r2part, type = c("R2")) +
+  theme_bw() +
+  labs(title = "Variance Explained by Model Components")
+```
+
+The proportion of variance explained by fixed effects (marginal R²) was XX, while the total variance explained including random effects (conditional R²) was XX.
+
+```{r r2-values}
+r2_table <- data.frame(
+  Model = c("Interactive", "Amount Only", "Fragmentation Only", "Additive"),
+  R2_m = c(r.squaredGLMM(modC500int)[1],
+           r.squaredGLMM(modC500_A)[1],
+           r.squaredGLMM(modC500_F)[1],
+           r.squaredGLMM(modC500_AF)[1]),
+  R2_c = c(r.squaredGLMM(modC500int)[2],
+           r.squaredGLMM(modC500_A)[2],
+           r.squaredGLMM(modC500_F)[2],
+           r.squaredGLMM(modC500_AF)[2])
+)
+
+kable(r2_table, 
+      caption = "Marginal (R2_m) and conditional (R2_c) R2 values for each model")
+```
+
+
+
+Table 1. Model selection results comparing the effects of habitat amount, edge density, and their interaction on Black-throated Green Warbler occupancy across three spatial scales (150m, 500m, 1000m) and three fragmentation measurement methods (A, B, C). Models are ranked by AIC values. Model types include interaction models (INT) with habitat amount × edge density, and additive models (AF) with habitat amount + edge density. All models included a spatial autocovariate term and random effects for site, season, and year. Delta R²m shows variance explained by fixed effects; delta R²c shows total variance explained including random effects.
+
+```{r}
+knitr::kable(
+  data.frame(
+    Scale = c("500m", "150m", "1000m", "500m", "1000m", "150m", "500m", "1000m", "500m"),
+    Method = c("C", "C", "C", "B", "B", "B", "A", "A", "A"),
+    Model = c("INT", "INT", "AF", "AF", "AF", "INT", "AF", "AF", "AF"),
+    AIC = c(1704.2, 1711.4, 1715.7, 1720.2, 1721.7, 1724.4, 1727.4, 1725.4, 1733.5),
+    deltaAIC = c(0.0, 7.2, 11.5, 16.0, 17.5, 20.2, 23.2, 21.2, 29.3),
+    Weight = c(0.826, 0.996, 0.709, 0.569, 0.709, 0.753, 0.562, 0.679, 0.028),
+    delta_R2m = c(0.244, 0.210, 0.214, 0.211, 0.184, 0.188, 0.186, 0.174, 0.199),
+    delta_R2c = c(0.424, 0.399, 0.419, 0.411, 0.403, 0.388, 0.398, 0.400, 0.413)
+  ),
+  caption = "Table 1: Model Selection Results Across Methods and Scales (sorted by AIC)",
+  col.names = c("Scale", "Method", "Model", "AIC", "ΔAIC", "Weight", "delta R²m", "delta R²c"),
+  digits = 3,
+  align = c('l', 'l', 'l', 'r', 'r', 'r', 'r', 'r')
+)
+```
+
+This table shows that Method C at the 500m scale with an interaction term provided the best model fit (lowest AIC = 1704.2) and explained the highest proportion of variance in the data (delta R²m = 0.244, delta R²c = 0.424). Models using Method C consistently outperformed other methods across all spatial scales, with the top three models all using this method.
+
+## Discussion
+
+#[Interpret results in context of research questions and hypotheses]
+
+#Our analysis indicates that [habitat amount/fragmentation/both] significantly influence bird occupancy in this system. The [selected #model] suggests that [key findings about relative importance and interactions].
